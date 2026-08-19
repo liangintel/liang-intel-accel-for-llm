@@ -1,10 +1,11 @@
 // Copyright (C) 2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-// QAT and CPU workers share one task pool. Each worker claims another item when a request completes,
-// so the faster backend naturally processes more of the batch. QAT workers keep multiple
-// asynchronous requests in flight, while CPU workers run one synchronous raw-DEFLATE request each.
-// Both backends produce mutually compatible streams, so either backend can decompress any item.
+// QAT, IAA and CPU workers share one task pool. Each worker claims another item when a request
+// completes, so the faster backend naturally processes more of the batch. QAT and IAA workers keep
+// multiple asynchronous requests in flight, while CPU workers run one synchronous raw-DEFLATE
+// request each. All backends produce mutually compatible streams, so any backend can decompress any
+// item.
 
 #include <torch/extension.h>
 
@@ -20,6 +21,7 @@
 #include "env.h"
 #include "iaxl_common.h"
 #include "cpu_zip.h"
+#include "iaa_zip.h"
 #include "qat_zip.h"
 #include "data_shuffle.h"
 #include "lossy.h"
@@ -29,15 +31,66 @@
 
 namespace kv_zip {
 
-enum class ZipBackend { QAT, CPU };
+enum class ZipBackend { QAT, IAA, CPU };
+
+static int zip_src_cap(ZipBackend backend) {
+    switch (backend) {
+    case ZipBackend::QAT:
+        return qat_zip_src_cap();
+    case ZipBackend::IAA:
+        return iaa_zip_src_cap();
+    default:
+        return cpu_zip_src_cap();
+    }
+}
+
+static int zip_compress(ZipBackend backend, int slot, void *src, int len) {
+    switch (backend) {
+    case ZipBackend::QAT:
+        return qat_zip_compress(slot, src, len);
+    case ZipBackend::IAA:
+        return iaa_zip_compress(slot, src, len);
+    default:
+        return cpu_zip_compress(slot, src, len);
+    }
+}
+
+static int zip_decompress(ZipBackend backend, int slot, void *src, int len) {
+    switch (backend) {
+    case ZipBackend::QAT:
+        return qat_zip_decompress(slot, src, len);
+    case ZipBackend::IAA:
+        return iaa_zip_decompress(slot, src, len);
+    default:
+        return cpu_zip_decompress(slot, src, len);
+    }
+}
+
+static int zip_wait(ZipBackend backend, int slot, void **dest, int *len) {
+    switch (backend) {
+    case ZipBackend::QAT:
+        return qat_zip_wait(slot, dest, len);
+    case ZipBackend::IAA:
+        return iaa_zip_wait(slot, dest, len);
+    default:
+        return cpu_zip_wait(slot, dest, len);
+    }
+}
 
 static void ensure_zip_init() {
     static std::once_flag flag;
     std::call_once(flag, [] {
-        IAXL_CHECK(envs.IAXL_QAT_ZIP_ENABLE || envs.IAXL_CPU_ZIP_ENABLE,
-                   "kv_zip: QAT and CPU zip backends are both disabled");
+        IAXL_CHECK(envs.IAXL_QAT_ZIP_ENABLE || envs.IAXL_IAA_ZIP_ENABLE || envs.IAXL_CPU_ZIP_ENABLE,
+                   "kv_zip: QAT, IAA and CPU zip backends are all disabled");
+        // Any worker may decompress any chunk, but Intel QPL decodes at most a 4 KB
+        // history window while QAT gen4 always compresses with 32 KB.
+        IAXL_CHECK(!(envs.IAXL_QAT_ZIP_ENABLE && envs.IAXL_IAA_ZIP_ENABLE),
+                   "kv_zip: IAA cannot decompress QAT streams; enable only one of "
+                   "IAXL_QAT_ZIP_ENABLE and IAXL_IAA_ZIP_ENABLE");
         if (envs.IAXL_QAT_ZIP_ENABLE)
             IAXL_CHECK(qat_zip_init() == 0, "kv_zip: qat_zip_init failed");
+        if (envs.IAXL_IAA_ZIP_ENABLE)
+            IAXL_CHECK(iaa_zip_init() == 0, "kv_zip: iaa_zip_init failed");
         if (envs.IAXL_CPU_ZIP_ENABLE)
             IAXL_CHECK(cpu_zip_init() == 0, "kv_zip: cpu_zip_init failed");
     });
@@ -49,10 +102,15 @@ static void zip_pipeline(size_t n, Submit &&submit, Complete &&complete) {
     const int qat_depth = envs.IAXL_QAT_ZIP_ENABLE ? qat_zip_queue_depth() : 1;
     const int qat_available = envs.IAXL_QAT_ZIP_ENABLE ? qat_zip_num_slots() / qat_depth : 0;
     const int qat_workers = envs.IAXL_QAT_ZIP_ENABLE ? envs.IAXL_QAT_INSTANCE_NUM : 0;
+    const int iaa_depth = envs.IAXL_IAA_ZIP_ENABLE ? iaa_zip_queue_depth() : 1;
+    const int iaa_available = envs.IAXL_IAA_ZIP_ENABLE ? iaa_zip_num_slots() / iaa_depth : 0;
+    const int iaa_workers = envs.IAXL_IAA_ZIP_ENABLE ? envs.IAXL_IAA_INSTANCE_NUM : 0;
     const int cpu_workers = envs.IAXL_CPU_ZIP_ENABLE ? cpu_zip_num_slots() : 0;
-    const int worker_count = qat_workers + cpu_workers;
+    const int worker_count = qat_workers + iaa_workers + cpu_workers;
     IAXL_CHECK(qat_workers <= qat_available,
                "kv_zip: IAXL_QAT_INSTANCE_NUM exceeds available QAT instances");
+    IAXL_CHECK(iaa_workers <= iaa_available,
+               "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
     IAXL_CHECK(worker_count == envs.IAXL_OMP_THREAD_NUM,
                "kv_zip: compression workers do not match OMP_NUM_THREADS");
 
@@ -60,10 +118,22 @@ static void zip_pipeline(size_t n, Submit &&submit, Complete &&complete) {
 #pragma omp parallel num_threads(worker_count)
     {
         const int t = omp_get_thread_num();
-        const bool use_qat = t < qat_workers;
-        const ZipBackend backend = use_qat ? ZipBackend::QAT : ZipBackend::CPU;
-        const int depth = use_qat ? qat_depth : 1;
-        const int base = use_qat ? t * qat_depth : t - qat_workers;
+        ZipBackend backend;
+        int depth;
+        int base;
+        if (t < qat_workers) {
+            backend = ZipBackend::QAT;
+            depth = qat_depth;
+            base = t * qat_depth;
+        } else if (t < qat_workers + iaa_workers) {
+            backend = ZipBackend::IAA;
+            depth = iaa_depth;
+            base = (t - qat_workers) * iaa_depth;
+        } else {
+            backend = ZipBackend::CPU;
+            depth = 1;
+            base = t - qat_workers - iaa_workers;
+        }
         IAXL_CHECK(omp_get_num_threads() == worker_count,
                    "kv_zip: OpenMP did not create the configured worker team");
 
@@ -83,8 +153,7 @@ static void zip_pipeline(size_t n, Submit &&submit, Complete &&complete) {
         for (int s = 0; in_flight > 0; s = (s + 1) % active_depth) {
             void *out;
             int out_len;
-            const int status = use_qat ? qat_zip_wait(base + s, &out, &out_len)
-                                       : cpu_zip_wait(base + s, &out, &out_len);
+            const int status = zip_wait(backend, base + s, &out, &out_len);
             IAXL_CHECK(status == 0, "kv_zip: zip wait failed");
             complete(backend, slot_item[s], out, out_len);
 
@@ -155,13 +224,10 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
             prep(i, &data, &nb);
             IAXL_CHECK(nb <= static_cast<size_t>(INT_MAX),
                        "kv_zip: tensor byte size exceeds zip integer length range");
-            const int src_cap =
-                backend == ZipBackend::QAT ? qat_zip_src_cap() : cpu_zip_src_cap();
+            const int src_cap = zip_src_cap(backend);
             IAXL_CHECK(nb <= static_cast<size_t>(src_cap),
                        "kv_zip: tensor byte size exceeds zip source capacity");
-            const int status = backend == ZipBackend::QAT
-                                   ? qat_zip_compress(slot, data, static_cast<int>(nb))
-                                   : cpu_zip_compress(slot, data, static_cast<int>(nb));
+            const int status = zip_compress(backend, slot, data, static_cast<int>(nb));
             IAXL_CHECK(status == 0, "kv_zip: zip compress failed");
         },
         [&](ZipBackend, size_t i, void *out, int out_len) { pack(i, out, out_len); });
@@ -221,9 +287,8 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
             const int *hdr = reinterpret_cast<const int *>(data_ptrs[i]);
             const char *payload = data_ptrs[i] + sizeof(int) * 2;
             const int payload_len = hdr[0] < 0 ? -hdr[0] : hdr[0];
-            const int status = backend == ZipBackend::QAT
-                                   ? qat_zip_decompress(slot, const_cast<char *>(payload), payload_len)
-                                   : cpu_zip_decompress(slot, const_cast<char *>(payload), payload_len);
+            const int status =
+                zip_decompress(backend, slot, const_cast<char *>(payload), payload_len);
             IAXL_CHECK(status == 0, "kv_zip: zip decompress failed");
         },
         [&](ZipBackend, size_t item, void *out, int out_len) {

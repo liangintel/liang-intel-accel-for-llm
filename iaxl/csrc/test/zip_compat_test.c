@@ -9,11 +9,13 @@
 
 #include "cpu_zip.h"
 #include "env.h"
+#include "iaa_zip.h"
 #include "qat_zip.h"
 
-static int raw_deflate(const unsigned char *src, int src_len, unsigned char *dst, int *dst_len) {
+static int raw_deflate(const unsigned char *src, int src_len, unsigned char *dst, int *dst_len,
+                       int window_bits) {
     z_stream stream = {0};
-    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8,
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, window_bits, 8,
                      Z_DEFAULT_STRATEGY) != Z_OK)
         return -1;
     stream.next_in = (Bytef *)src;
@@ -59,11 +61,15 @@ int main(int argc, char **argv) {
     unsigned char *input = NULL;
     unsigned char *qat_data = NULL;
     unsigned char *cpu_data = NULL;
+    unsigned char *iaa_data = NULL;
     unsigned char *raw_data = NULL;
 
     if (devices)
         setenv("IAXL_QAT_DEVICES", devices, 1);
     setenv("IAXL_CPU_ZIP_THREADS", "1", 1);
+    setenv("IAXL_IAA_ZIP_ENABLE", "1", 1);
+    setenv("IAXL_IAA_ZIP_INSTANCES_PER_DEVICE", "1", 1);
+    setenv("IAXL_IAA_ZIP_QUEUE_DEPTH", "1", 1);
     setenv("IAXL_ZIP_SRC_CAP", "262144", 1);
     setenv("IAXL_ZIP_DST_CAP", "262144", 1);
     envs_init();
@@ -71,10 +77,17 @@ int main(int argc, char **argv) {
     input = malloc((size_t)input_len);
     if (!input)
         goto out;
-    for (int i = 0; i < input_len; i++)
-        input[i] = (unsigned char)(i % 251);
+    // A 16 KB pseudo-random pattern repeated: matches sit far beyond a 4 KB window, so
+    // this catches compressors that emit distances Intel QPL cannot decode.
+    unsigned int seed = 12345;
+    for (int i = 0; i < 16 * 1024; i++) {
+        seed = seed * 1103515245u + 12345u;
+        input[i] = (unsigned char)(seed >> 16);
+    }
+    for (int i = 16 * 1024; i < input_len; i++)
+        input[i] = input[i - 16 * 1024];
 
-    if (qat_zip_init() != 0 || cpu_zip_init() != 0) {
+    if (qat_zip_init() != 0 || cpu_zip_init() != 0 || iaa_zip_init() != 0) {
         fprintf(stderr, "[compat] backend initialization failed\n");
         goto out;
     }
@@ -145,6 +158,38 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[compat] QAT and CPU compressed streams are not mutually compatible\n");
     }
 
+    rc = iaa_zip_compress(0, input, input_len);
+    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len)) != 0 || output_len <= 0) {
+        fprintf(stderr, "[compat] IAA compression failed: status=%d length=%d\n", rc, output_len);
+        goto out;
+    }
+    iaa_data = malloc((size_t)output_len);
+    if (!iaa_data)
+        goto out;
+    memcpy(iaa_data, output, (size_t)output_len);
+    int iaa_len = output_len;
+
+    rc = cpu_zip_decompress(0, iaa_data, iaa_len);
+    if (rc != 0 || (rc = cpu_zip_wait(0, &output, &output_len)) != 0 ||
+        verify("IAA compress -> CPU decompress", input, input_len, output, output_len) != 0) {
+        fprintf(stderr, "[compat] IAA compress -> CPU decompress failed: %d\n", rc);
+        failures++;
+    }
+
+    rc = qat_zip_decompress(0, iaa_data, iaa_len);
+    if (rc != 0 || (rc = qat_zip_wait(0, &output, &output_len)) != 0 ||
+        verify("IAA compress -> QAT decompress", input, input_len, output, output_len) != 0) {
+        fprintf(stderr, "[compat] IAA compress -> QAT decompress failed: %d\n", rc);
+        failures++;
+    }
+
+    rc = iaa_zip_decompress(0, cpu_data, cpu_len);
+    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len)) != 0 ||
+        verify("CPU compress -> IAA decompress", input, input_len, output, output_len) != 0) {
+        fprintf(stderr, "[compat] CPU compress -> IAA decompress failed: %d\n", rc);
+        failures++;
+    }
+
     int raw_cap = envs.IAXL_ZIP_SRC_CAP > envs.IAXL_ZIP_DST_CAP ? envs.IAXL_ZIP_SRC_CAP
                                                                 : envs.IAXL_ZIP_DST_CAP;
     raw_data = malloc((size_t)raw_cap);
@@ -156,7 +201,18 @@ int main(int argc, char **argv) {
         goto out;
 
     raw_len = envs.IAXL_ZIP_DST_CAP;
-    if (raw_deflate(input, input_len, raw_data, &raw_len) != 0) {
+    if (raw_deflate(input, input_len, raw_data, &raw_len, -MAX_WBITS) != 0) {
+        fprintf(stderr, "[compat] raw zlib deflate failed\n");
+        goto out;
+    }
+    raw_len = envs.IAXL_ZIP_SRC_CAP;
+    if (raw_inflate(iaa_data, iaa_len, raw_data, &raw_len) != 0 ||
+        verify("IAA compress -> raw zlib inflate", input, input_len, raw_data, raw_len) != 0)
+        goto out;
+
+    // Intel QPL only decodes a 4 KB history window, so the reference stream must use one.
+    raw_len = envs.IAXL_ZIP_DST_CAP;
+    if (raw_deflate(input, input_len, raw_data, &raw_len, -12) != 0) {
         fprintf(stderr, "[compat] raw zlib deflate failed\n");
         goto out;
     }
@@ -166,15 +222,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[compat] raw zlib -> QAT failed: %d\n", rc);
         goto out;
     }
-    printf("[compat] QAT uses raw DEFLATE; CPU can interoperate by using zlib raw mode\n");
+    rc = iaa_zip_decompress(0, raw_data, raw_len);
+    if (rc != 0 || (rc = iaa_zip_wait(0, &output, &output_len)) != 0 ||
+        verify("raw zlib deflate -> IAA decompress", input, input_len, output, output_len) != 0) {
+        fprintf(stderr, "[compat] raw zlib -> IAA failed: %d\n", rc);
+        goto out;
+    }
+    printf("[compat] QAT, IAA and CPU all use raw DEFLATE and interoperate via zlib raw mode\n");
+    printf("[compat] note: IAA decodes at most a 4 KB history window, so QAT streams "
+           "(always 32 KB on gen4) must not be routed to IAA\n");
     if (failures == 0)
         status = 0;
 
 out:
     free(raw_data);
+    free(iaa_data);
     free(cpu_data);
     free(qat_data);
     free(input);
+    iaa_zip_shutdown();
     cpu_zip_shutdown();
     qat_zip_shutdown();
     return status;

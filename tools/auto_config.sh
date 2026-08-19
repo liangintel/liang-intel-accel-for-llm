@@ -363,6 +363,7 @@ cpu_zip_thread_count() {
     local min_rank_cpu_count=$1
     local qat_threads=$2
     local reserved_cpus=$3
+    local iaa_threads=${4:-0}
 
     if ! [[ "$min_rank_cpu_count" =~ ^[1-9][0-9]*$ ]]; then
         echo "ERROR: minimum rank CPU count must be a positive integer" >&2
@@ -372,16 +373,51 @@ cpu_zip_thread_count() {
         echo "ERROR: IAXL_QAT_INSTANCE_NUM must be a non-negative integer" >&2
         return 1
     fi
+    if ! [[ "$iaa_threads" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: IAXL_IAA_INSTANCE_NUM must be a non-negative integer" >&2
+        return 1
+    fi
     if ! [[ "$reserved_cpus" =~ ^[0-9]+$ ]]; then
         echo "ERROR: IAXL_RESERVED_CPU_NUM must be a non-negative integer" >&2
         return 1
     fi
-    echo "$((min_rank_cpu_count - qat_threads - reserved_cpus))"
+    echo "$((min_rank_cpu_count - qat_threads - iaa_threads - reserved_cpus))"
+}
+
+iaa_thread_count() {
+    local numa_nodes=$1
+    local instances_per_node=$2
+    local -a node_indices=()
+
+    if ! [[ "$instances_per_node" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: IAXL_IAA_ZIP_INSTANCES_PER_DEVICE must be a positive integer" >&2
+        return 1
+    fi
+    if [[ -z "$numa_nodes" || "${numa_nodes,,}" == "auto" ]]; then
+        # Mirrors the C backend: "auto" spreads over every NUMA node owning an IAA device.
+        local -a auto_nodes=()
+        local dev node
+        for dev in /sys/bus/dsa/devices/iax[0-9]*; do
+            [[ -r "$dev/numa_node" ]] || continue
+            node=$(<"$dev/numa_node")
+            ((node >= 0)) || continue
+            [[ " ${auto_nodes[*]} " == *" $node "* ]] || auto_nodes+=("$node")
+        done
+        echo "$(((${#auto_nodes[@]} > 0 ? ${#auto_nodes[@]} : 1) * instances_per_node))"
+        return 0
+    fi
+    IFS=, read -r -a node_indices <<<"$numa_nodes"
+    if ((${#node_indices[@]} == 0)); then
+        echo "ERROR: IAXL_IAA_DEVICES must contain at least one NUMA node index" >&2
+        return 1
+    fi
+    echo "$((${#node_indices[@]} * instances_per_node))"
 }
 
 omp_thread_count() {
     local qat_threads=$1
     local cpu_zip_threads=$2
+    local iaa_threads=${3:-0}
 
     if ! [[ "$qat_threads" =~ ^[0-9]+$ ]]; then
         echo "ERROR: IAXL_QAT_INSTANCE_NUM must be a non-negative integer" >&2
@@ -391,7 +427,11 @@ omp_thread_count() {
         echo "ERROR: IAXL_CPU_ZIP_THREADS must be a non-negative integer" >&2
         return 1
     fi
-    echo "$((qat_threads + cpu_zip_threads))"
+    if ! [[ "$iaa_threads" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: IAXL_IAA_INSTANCE_NUM must be a non-negative integer" >&2
+        return 1
+    fi
+    echo "$((qat_threads + iaa_threads + cpu_zip_threads))"
 }
 
 validate_omp_config() {
@@ -402,6 +442,10 @@ validate_omp_config() {
         echo "ERROR: IAXL_QAT_INSTANCE_NUM must be a non-negative integer" >&2
         return 1
     fi
+    if ! [[ "$IAXL_IAA_INSTANCE_NUM" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: IAXL_IAA_INSTANCE_NUM must be a non-negative integer" >&2
+        return 1
+    fi
     if ! [[ "$IAXL_RESERVED_CPU_NUM" =~ ^[0-9]+$ ]]; then
         echo "ERROR: IAXL_RESERVED_CPU_NUM must be a non-negative integer" >&2
         return 1
@@ -410,17 +454,17 @@ validate_omp_config() {
         echo "ERROR: IAXL_CPU_ZIP_THREADS must be a non-negative integer" >&2
         return 1
     fi
-    if ((IAXL_QAT_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS == 0)); then
-        echo "ERROR: at least one QAT or CPU zip worker must be enabled" >&2
+    if ((IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS == 0)); then
+        echo "ERROR: at least one QAT, IAA or CPU zip worker must be enabled" >&2
         return 1
     fi
     if ! [[ "$IAXL_OMP_THREAD_NUM" =~ ^[1-9][0-9]*$ ]] ||
-        ((IAXL_OMP_THREAD_NUM != IAXL_QAT_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS)); then
-        echo "ERROR: IAXL_OMP_THREAD_NUM must equal IAXL_QAT_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS" >&2
+        ((IAXL_OMP_THREAD_NUM != IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS)); then
+        echo "ERROR: IAXL_OMP_THREAD_NUM must equal IAXL_QAT_INSTANCE_NUM + IAXL_IAA_INSTANCE_NUM + IAXL_CPU_ZIP_THREADS" >&2
         return 1
     fi
     if ((IAXL_OMP_THREAD_NUM + IAXL_RESERVED_CPU_NUM > min_rank_cpu_count)); then
-        echo "ERROR: QAT ($IAXL_QAT_INSTANCE_NUM) + CPU zip ($IAXL_CPU_ZIP_THREADS) + reserved " \
+        echo "ERROR: QAT ($IAXL_QAT_INSTANCE_NUM) + IAA ($IAXL_IAA_INSTANCE_NUM) + CPU zip ($IAXL_CPU_ZIP_THREADS) + reserved " \
             "($IAXL_RESERVED_CPU_NUM) exceeds the smallest rank CPU allocation ($min_rank_cpu_count)" >&2
         return 1
     fi
@@ -436,6 +480,7 @@ validate_omp_config() {
         "OpenMP configuration:" \
         "  rank CPU counts=$rank_cpu_counts" \
         "  IAXL_QAT_INSTANCE_NUM=$IAXL_QAT_INSTANCE_NUM" \
+        "  IAXL_IAA_INSTANCE_NUM=$IAXL_IAA_INSTANCE_NUM" \
         "  IAXL_CPU_ZIP_THREADS=$IAXL_CPU_ZIP_THREADS" \
         "  IAXL_RESERVED_CPU_NUM=$IAXL_RESERVED_CPU_NUM" \
         "  IAXL_OMP_THREAD_NUM=$IAXL_OMP_THREAD_NUM"
