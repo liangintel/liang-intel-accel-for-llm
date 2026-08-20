@@ -201,9 +201,10 @@ static void instance_init(Instance *d, const RawInst *r) {
     sd.sessDirection = CPA_DC_DIR_COMBINED;
     sd.sessState = CPA_DC_STATELESS;
     sd.checksum = CPA_DC_CRC32;
-    // Intel QPL only decodes a 4 KB history window, so shrink ours whenever an IAA
-    // worker may be the one to decompress this chunk.
-    sd.windowSize = envs.IAXL_IAA_ZIP_ENABLE ? CPA_DC_WINSIZE_4K : CPA_DC_WINSIZE_32K;
+    // gen4 always compresses with a 32 KB history window: cpaDcQueryCapabilities
+    // reports no smaller size and a CPA_DC_WINSIZE_4K session still emits 32 KB
+    // distances, which is why IAA cannot decompress QAT streams.
+    sd.windowSize = CPA_DC_WINSIZE_32K;
 
     d->inst = r->inst;
     d->node = r->node;

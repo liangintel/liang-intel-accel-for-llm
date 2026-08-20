@@ -21,12 +21,6 @@ export IAXL_IAA_ZIP_ENABLE=${IAXL_IAA_ZIP_ENABLE:-0} # Enable IAA (QPL) compress
 export IAXL_CPU_ZIP_ENABLE=${IAXL_CPU_ZIP_ENABLE:-1} # Enable CPU compression workers (0/1)
 export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy transfers (0/1)
 
-# IAA decodes at most a 4 KB DEFLATE history window; QAT gen4 always emits 32 KB.
-if [[ "${IAXL_QAT_ZIP_ENABLE,,}" =~ ^(1|true|yes|on)$ && "${IAXL_IAA_ZIP_ENABLE,,}" =~ ^(1|true|yes|on)$ ]]; then
-    echo "ERROR: IAXL_QAT_ZIP_ENABLE and IAXL_IAA_ZIP_ENABLE are mutually exclusive" >&2
-    return 1 2>/dev/null || exit 1
-fi
-
 # ---- Async KV load ----------------------------------------------------------
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD=${KVSHRINK_VLLM_KV_ASYNC_LOAD_THRESHOLD:--1} # -1=always sync, 0=always async, N=async when in-flight reqs >= N
 export KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS=${KVSHRINK_VLLM_KV_ASYNC_LOAD_LAYERS:--1}       # -1=wait all layers, N=start prefill after first N layers (needs THRESHOLD>=0)

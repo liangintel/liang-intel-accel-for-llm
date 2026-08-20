@@ -4,8 +4,13 @@
 // QAT, IAA and CPU workers share one task pool. Each worker claims another item when a request
 // completes, so the faster backend naturally processes more of the batch. QAT and IAA workers keep
 // multiple asynchronous requests in flight, while CPU workers run one synchronous raw-DEFLATE
-// request each. All backends produce mutually compatible streams, so any backend can decompress any
-// item.
+// request each.
+//
+// All backends emit raw DEFLATE, but compatibility is one-way: IAA decodes at most a 4 KB history
+// window while QAT gen4 always compresses with 32 KB and silently ignores
+// CpaDcSessionSetupData.windowSize. So QAT and CPU can decompress anything, whereas IAA can only
+// decompress what IAA and a 4 KB-window CPU produced. IAA therefore sits out the decompression
+// pass whenever QAT is also enabled.
 
 #include <torch/extension.h>
 
@@ -82,11 +87,6 @@ static void ensure_zip_init() {
     std::call_once(flag, [] {
         IAXL_CHECK(envs.IAXL_QAT_ZIP_ENABLE || envs.IAXL_IAA_ZIP_ENABLE || envs.IAXL_CPU_ZIP_ENABLE,
                    "kv_zip: QAT, IAA and CPU zip backends are all disabled");
-        // Any worker may decompress any chunk, but Intel QPL decodes at most a 4 KB
-        // history window while QAT gen4 always compresses with 32 KB.
-        IAXL_CHECK(!(envs.IAXL_QAT_ZIP_ENABLE && envs.IAXL_IAA_ZIP_ENABLE),
-                   "kv_zip: IAA cannot decompress QAT streams; enable only one of "
-                   "IAXL_QAT_ZIP_ENABLE and IAXL_IAA_ZIP_ENABLE");
         if (envs.IAXL_QAT_ZIP_ENABLE)
             IAXL_CHECK(qat_zip_init() == 0, "kv_zip: qat_zip_init failed");
         if (envs.IAXL_IAA_ZIP_ENABLE)
@@ -97,22 +97,24 @@ static void ensure_zip_init() {
 }
 
 template <class Submit, class Complete>
-static void zip_pipeline(size_t n, Submit &&submit, Complete &&complete) {
+static void zip_pipeline(size_t n, bool allow_iaa, Submit &&submit, Complete &&complete) {
     ensure_zip_init();
     const int qat_depth = envs.IAXL_QAT_ZIP_ENABLE ? qat_zip_queue_depth() : 1;
     const int qat_available = envs.IAXL_QAT_ZIP_ENABLE ? qat_zip_num_slots() / qat_depth : 0;
     const int qat_workers = envs.IAXL_QAT_ZIP_ENABLE ? envs.IAXL_QAT_INSTANCE_NUM : 0;
     const int iaa_depth = envs.IAXL_IAA_ZIP_ENABLE ? iaa_zip_queue_depth() : 1;
     const int iaa_available = envs.IAXL_IAA_ZIP_ENABLE ? iaa_zip_num_slots() / iaa_depth : 0;
-    const int iaa_workers = envs.IAXL_IAA_ZIP_ENABLE ? envs.IAXL_IAA_INSTANCE_NUM : 0;
+    const int iaa_configured = envs.IAXL_IAA_ZIP_ENABLE ? envs.IAXL_IAA_INSTANCE_NUM : 0;
+    const int iaa_workers = allow_iaa ? iaa_configured : 0;
     const int cpu_workers = envs.IAXL_CPU_ZIP_ENABLE ? cpu_zip_num_slots() : 0;
     const int worker_count = qat_workers + iaa_workers + cpu_workers;
     IAXL_CHECK(qat_workers <= qat_available,
                "kv_zip: IAXL_QAT_INSTANCE_NUM exceeds available QAT instances");
-    IAXL_CHECK(iaa_workers <= iaa_available,
+    IAXL_CHECK(iaa_configured <= iaa_available,
                "kv_zip: IAXL_IAA_INSTANCE_NUM exceeds available IAA instances");
-    IAXL_CHECK(worker_count == envs.IAXL_OMP_THREAD_NUM,
+    IAXL_CHECK(qat_workers + iaa_configured + cpu_workers == envs.IAXL_OMP_THREAD_NUM,
                "kv_zip: compression workers do not match OMP_NUM_THREADS");
+    IAXL_CHECK(worker_count > 0, "kv_zip: no worker can decompress these streams");
 
     std::atomic<size_t> next{0};
 #pragma omp parallel num_threads(worker_count)
@@ -217,7 +219,7 @@ void kv_zip_compress_batch(const std::vector<torch::Tensor> &tensors, std::vecto
     };
 
     zip_pipeline(
-        n,
+        n, /*allow_iaa=*/true,
         [&](ZipBackend backend, int slot, size_t i) {
             char *data;
             size_t nb;
@@ -281,7 +283,7 @@ void kv_zip_decompress_batch(const std::vector<const char *> &data_ptrs,
     }
 
     zip_pipeline(
-        compressed_count,
+        compressed_count, /*allow_iaa=*/!envs.IAXL_QAT_ZIP_ENABLE,
         [&](ZipBackend backend, int slot, size_t item) {
             const size_t i = compressed_indices[item];
             const int *hdr = reinterpret_cast<const int *>(data_ptrs[i]);
