@@ -59,6 +59,8 @@ TESTS        := $(foreach m,$(MODULES),$(if $(call test_src,$(m)),$(m)_test))
 TEST_TARGETS := $(foreach m,$(MODULES),$(if $(call test_src,$(m)),test-$(m)))
 TESTS        += zip_compat_test
 TEST_TARGETS += test-zip-compat
+TESTS        += zip_throughput_test
+TEST_TARGETS += test-zip-throughput
 
 .PHONY: all test clean qat-userspace qpl-userspace $(TEST_TARGETS)
 
@@ -119,6 +121,13 @@ zip_compat_test: test/zip_compat_test.c $(LIBDIR)/libqat_zip.so $(LIBDIR)/libcpu
 
 test-zip-compat: zip_compat_test
 	(cd test && numactl --cpunodebind=0 --membind=0 ../zip_compat_test $(ARGS))
+
+
+zip_throughput_test: test/zip_throughput_test.c $(LIBDIR)/libqat_zip.so $(LIBDIR)/libiaa_zip.so
+	$(CC) $(CFLAGS) $(iaa_zip_CFLAGS) -fopenmp -o $@ $< -L$(LIBDIR) -lqat_zip -liaa_zip $(RPATH) $(LDFLAGS)
+
+test-zip-throughput: zip_throughput_test
+	(cd test && numactl --cpunodebind=0 --membind=0 ../zip_throughput_test $(ARGS))
 
 
 qat-userspace: $(QATLIBS)
