@@ -20,7 +20,7 @@
 #define MAX_INSTANCES_PER_DEVICE 64
 #define MAX_INSTANCES (MAX_DEVICES * MAX_INSTANCES_PER_DEVICE)
 #define MAX_RAW_INSTANCES 256
-#define MAX_QUEUE_DEPTH 4
+#define MAX_QUEUE_DEPTH 16
 
 #define DEFAULT_INSTANCES_PER_DEVICE 4
 #define DEFAULT_SRC_CAP (256 * 1024)
@@ -201,6 +201,10 @@ static void instance_init(Instance *d, const RawInst *r) {
     sd.sessDirection = CPA_DC_DIR_COMBINED;
     sd.sessState = CPA_DC_STATELESS;
     sd.checksum = CPA_DC_CRC32;
+    // gen4 always compresses with a 32 KB history window: cpaDcQueryCapabilities
+    // reports no smaller size and a CPA_DC_WINSIZE_4K session still emits 32 KB
+    // distances, which is why IAA cannot decompress QAT streams.
+    sd.windowSize = CPA_DC_WINSIZE_32K;
 
     d->inst = r->inst;
     d->node = r->node;
@@ -224,7 +228,7 @@ static void instance_init(Instance *d, const RawInst *r) {
     IAXL_CHECK(cpaDcInitSession(d->inst, d->sess, &sd, NULL, dc_callback) == CPA_STATUS_SUCCESS,
                "qat_zip: cpaDcInitSession failed");
 
-    for (int si = 0; si < MAX_QUEUE_DEPTH; si++) {
+    for (int si = 0; si < g_queue_depth; si++) {
         Slot *sl = &d->slot[si];
         sl->src_meta = qaeMemAllocNUMA(meta_size, d->node, 64);
         sl->dst_meta = qaeMemAllocNUMA(meta_size, d->node, 64);
@@ -239,7 +243,7 @@ static void instance_teardown(Instance *d) {
     cpaDcRemoveSession(d->inst, d->sess);
     cpaDcStopInstance(d->inst);
     qaeMemFreeNUMA(&d->sess);
-    for (int si = 0; si < MAX_QUEUE_DEPTH; si++) {
+    for (int si = 0; si < g_queue_depth; si++) {
         Slot *sl = &d->slot[si];
         qaeMemFreeNUMA(&sl->src_meta);
         qaeMemFreeNUMA(&sl->dst_meta);

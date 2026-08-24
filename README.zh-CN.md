@@ -50,6 +50,9 @@ sudo ./tools/install_gdr_driver.sh
 | `TP_SIZE` | `2` | 必须配置；Tensor Parallel worker 数量，CPU、QAT 和 DSA 资源将据此自动配置 |
 | `IAXL_KV_COMPRESSION` | `1` | 启用 DEFLATE 压缩（`0`/`1`） |
 | `IAXL_QAT_ZIP_ENABLE` | `1` | 启用 QAT 压缩 worker（`0`/`1`） |
+| `IAXL_IAA_ZIP_ENABLE` | `0` | 通过 Intel QPL 启用 Intel IAA 压缩 worker（`0`/`1`）。可与 `IAXL_QAT_ZIP_ENABLE` 同时开启，但此时 IAA 只参与压缩：IAA 最多只能解码 4 KB 的 DEFLATE 历史窗口，而 QAT gen4 固定使用 32 KB |
+| `IAXL_ZIP_JOB_SIZE` | `0` | 单次压缩作业的输入字节数。`0` 表示整块作为一次作业。设为 `4096` 或更小可把所有回溯距离限制在 IAA 能解码的 4 KB 窗口内，从而让 IAA 也参与解压，代价是压缩率和加速器吞吐下降 |
+| `IAXL_IAA_ZIP_PATH` | `hardware` | QPL 执行路径：`hardware`、`software` 或 `auto` |
 | `IAXL_CPU_ZIP_ENABLE` | `1` | 启用 CPU 压缩 worker（`0`/`1`） |
 | `IAXL_DSA_GD_ENABLE` | `0` | 启用 Intel DSA + GDRCopy 传输（`0`/`1`） |
 | `IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS` | `1` | 前 N 层 KV cache 不进行压缩 |

@@ -68,7 +68,15 @@ int cpu_zip_compress(int slot, void *src, int len) {
     CpuZipSlot *state = &g_slots[slot];
     z_stream stream = {0};
     state->ready = 0;
-    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8,
+    // Intel QPL only decodes a 4 KB history window, so shrink ours whenever an IAA
+    // worker may be the one to decompress this chunk. IAXL_ZIP_JOB_SIZE already bounds
+    // the window when it is small enough, and with QAT enabled but no job cap the
+    // decompression pass excludes IAA anyway, so the full window stays available.
+    const int job_bounded =
+        envs.IAXL_ZIP_JOB_SIZE > 0 && envs.IAXL_ZIP_JOB_SIZE <= 4096;
+    const int window_bits =
+        (envs.IAXL_IAA_ZIP_ENABLE && !envs.IAXL_QAT_ZIP_ENABLE && !job_bounded) ? -12 : -MAX_WBITS;
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, window_bits, 8,
                      Z_DEFAULT_STRATEGY) != Z_OK)
         return -1;
     stream.next_in = src;

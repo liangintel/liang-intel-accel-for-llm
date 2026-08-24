@@ -45,13 +45,20 @@ struct Envs {
 
     int IAXL_ZIP_SRC_CAP;
     int IAXL_ZIP_DST_CAP;
+    int IAXL_ZIP_JOB_SIZE;
 
     bool IAXL_QAT_ZIP_ENABLE;
+    bool IAXL_IAA_ZIP_ENABLE;
     bool IAXL_CPU_ZIP_ENABLE;
     int IAXL_QAT_INSTANCE_NUM;
     const char *(*IAXL_QAT_DEVICES)(void);
     int IAXL_QAT_ZIP_INSTANCES_PER_DEVICE;
     int IAXL_QAT_ZIP_QUEUE_DEPTH;
+    int IAXL_IAA_INSTANCE_NUM;
+    const char *(*IAXL_IAA_DEVICES)(void);
+    int IAXL_IAA_ZIP_INSTANCES_PER_DEVICE;
+    int IAXL_IAA_ZIP_QUEUE_DEPTH;
+    const char *IAXL_IAA_ZIP_PATH;
     int IAXL_CPU_ZIP_THREADS;
     int IAXL_OMP_THREAD_NUM;
 

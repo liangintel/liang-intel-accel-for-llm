@@ -52,6 +52,9 @@ Common settings in `setvars.sh`:
 | `TP_SIZE` | `2` | Required; number of Tensor Parallel workers. CPU, QAT, and DSA resources are configured based on this value |
 | `IAXL_KV_COMPRESSION` | `1` | Enable DEFLATE compression (`0`/`1`) |
 | `IAXL_QAT_ZIP_ENABLE` | `1` | Enable QAT compression workers (`0`/`1`) |
+| `IAXL_IAA_ZIP_ENABLE` | `0` | Enable Intel IAA compression workers via Intel QPL (`0`/`1`). Can be combined with `IAXL_QAT_ZIP_ENABLE`, but IAA then only compresses: it decodes at most a 4 KB DEFLATE history window, while QAT gen4 always compresses with 32 KB |
+| `IAXL_ZIP_JOB_SIZE` | `0` | Bytes fed to a single compression job. `0` compresses each block as one job. A value of `4096` or less bounds every back-reference to the 4 KB window IAA decodes, so IAA can also join the decompression pass, at the cost of compression ratio and accelerator throughput |
+| `IAXL_IAA_ZIP_PATH` | `hardware` | QPL execution path: `hardware`, `software` or `auto` |
 | `IAXL_CPU_ZIP_ENABLE` | `1` | Enable CPU compression workers (`0`/`1`) |
 | `IAXL_DSA_GD_ENABLE` | `0` | Enable Intel DSA + GDRCopy transfers (`0`/`1`) |
 | `IAXL_KVSTORE_SKIP_COMPRESSION_LAYERS` | `1` | Do not compress the KV cache for the first N layers |

@@ -17,6 +17,7 @@ export IAXL_CMAKE_ARGS=${IAXL_CMAKE_ARGS:-""} # Extra cmake flags, e.g. "-DENABL
 # ---- Feature switches -------------------------------------------------------
 export IAXL_KV_COMPRESSION=${IAXL_KV_COMPRESSION:-1} # Enable DEFLATE compression (0/1)
 export IAXL_QAT_ZIP_ENABLE=${IAXL_QAT_ZIP_ENABLE:-1} # Enable QAT compression workers (0/1)
+export IAXL_IAA_ZIP_ENABLE=${IAXL_IAA_ZIP_ENABLE:-0} # Enable IAA (QPL) compression workers (0/1)
 export IAXL_CPU_ZIP_ENABLE=${IAXL_CPU_ZIP_ENABLE:-1} # Enable CPU compression workers (0/1)
 export IAXL_DSA_GD_ENABLE=${IAXL_DSA_GD_ENABLE:-0}   # Use Intel DSA + GDRCopy transfers (0/1)
 
@@ -60,6 +61,7 @@ printf '%s\n' \
     "  TP_SIZE=$TP_SIZE" \
     "  IAXL_KV_COMPRESSION=$IAXL_KV_COMPRESSION" \
     "  IAXL_QAT_ZIP_ENABLE=$IAXL_QAT_ZIP_ENABLE" \
+    "  IAXL_IAA_ZIP_ENABLE=$IAXL_IAA_ZIP_ENABLE" \
     "  IAXL_CPU_ZIP_ENABLE=$IAXL_CPU_ZIP_ENABLE" \
     "  IAXL_DSA_GD_ENABLE=$IAXL_DSA_GD_ENABLE" \
     "  VLLM_CPU_OMP_THREADS_BIND=$VLLM_CPU_OMP_THREADS_BIND" \
@@ -74,6 +76,7 @@ export IAXL_KV_LOSSY_TRUNC=${IAXL_KV_LOSSY_TRUNC:-0}                     # Lossy
 export IAXL_KV_DATA_SHUFFLE=${IAXL_KV_DATA_SHUFFLE:-0}                   # Byte-shuffle before compression (0/1)
 export IAXL_ZIP_SRC_CAP=${IAXL_ZIP_SRC_CAP:-262144}                      # Source/decompressed block capacity (256 KiB)
 export IAXL_ZIP_DST_CAP=${IAXL_ZIP_DST_CAP:-262144}                      # Compressed-output capacity (256 KiB)
+export IAXL_ZIP_JOB_SIZE=${IAXL_ZIP_JOB_SIZE:-0}                         # Bytes per compression job: 0 = whole block, <=4096 lets IAA decompress QAT output
 export IAXL_CACHE_DIR=${IAXL_CACHE_DIR:-_data/kvcache}                   # Base directory for persisted cache files
 export IAXL_CACHE_STREAM_SYNC_ON_GET=${IAXL_CACHE_STREAM_SYNC_ON_GET:-0} # CPU-sync the GPU stream on get() (0/1)
 export IAXL_CACHE_CACHEGROUP_SIZE=${IAXL_CACHE_CACHEGROUP_SIZE:-100}     # Reserved entries per cache group
@@ -92,17 +95,29 @@ case "${IAXL_QAT_ZIP_ENABLE,,}" in
         ;;
     *) export IAXL_QAT_INSTANCE_NUM=0 ;;
 esac
-export IAXL_QAT_ZIP_QUEUE_DEPTH=${IAXL_QAT_ZIP_QUEUE_DEPTH:-4} # In-flight requests per instance (<= 4)
+export IAXL_QAT_ZIP_QUEUE_DEPTH=${IAXL_QAT_ZIP_QUEUE_DEPTH:-4} # In-flight requests per instance (<= 16)
+
+# ---- Intel IAA (compression accelerator, via Intel QPL) ---------------------
+export IAXL_IAA_DEVICES=${IAXL_IAA_DEVICES:-auto}                                # Comma-separated NUMA nodes for IAA jobs, or "auto"
+export IAXL_IAA_ZIP_INSTANCES_PER_DEVICE=${IAXL_IAA_ZIP_INSTANCES_PER_DEVICE:-4} # Instances (driving threads) per IAA device; a NUMA node usually owns several
+export IAXL_IAA_ZIP_PATH=${IAXL_IAA_ZIP_PATH:-hardware}                          # QPL execution path: hardware | software | auto
+case "${IAXL_IAA_ZIP_ENABLE,,}" in
+    1|true|yes|on)
+        export IAXL_IAA_INSTANCE_NUM=${IAXL_IAA_INSTANCE_NUM:-$(iaa_thread_count "$IAXL_IAA_DEVICES" "$IAXL_IAA_ZIP_INSTANCES_PER_DEVICE")} || return 1 2>/dev/null || exit 1
+        ;;
+    *) export IAXL_IAA_INSTANCE_NUM=0 ;;
+esac
+export IAXL_IAA_ZIP_QUEUE_DEPTH=${IAXL_IAA_ZIP_QUEUE_DEPTH:-4} # In-flight requests per instance (<= 16)
 
 # ---- CPU / OpenMP compression workers --------------------------------------
 export IAXL_RESERVED_CPU_NUM=${IAXL_RESERVED_CPU_NUM:-4} # CPUs reserved for inference and other tasks
 case "${IAXL_CPU_ZIP_ENABLE,,}" in
     1|true|yes|on)
-        export IAXL_CPU_ZIP_THREADS=${IAXL_CPU_ZIP_THREADS:-$(cpu_zip_thread_count "$MIN_RANK_CPU_COUNT" "$IAXL_QAT_INSTANCE_NUM" "$IAXL_RESERVED_CPU_NUM")} || return 1 2>/dev/null || exit 1
+        export IAXL_CPU_ZIP_THREADS=${IAXL_CPU_ZIP_THREADS:-$(cpu_zip_thread_count "$MIN_RANK_CPU_COUNT" "$IAXL_QAT_INSTANCE_NUM" "$IAXL_RESERVED_CPU_NUM" "$IAXL_IAA_INSTANCE_NUM")} || return 1 2>/dev/null || exit 1
         ;;
     *) export IAXL_CPU_ZIP_THREADS=0 ;;
 esac
-export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS") || return 1 2>/dev/null || exit 1
+export IAXL_OMP_THREAD_NUM=$(omp_thread_count "$IAXL_QAT_INSTANCE_NUM" "$IAXL_CPU_ZIP_THREADS" "$IAXL_IAA_INSTANCE_NUM") || return 1 2>/dev/null || exit 1
 export OMP_NUM_THREADS=$IAXL_OMP_THREAD_NUM
 export OMP_THREAD_LIMIT=$IAXL_OMP_THREAD_NUM
 export OMP_MAX_ACTIVE_LEVELS=2
