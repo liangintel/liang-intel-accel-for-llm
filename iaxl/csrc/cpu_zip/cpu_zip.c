@@ -61,6 +61,12 @@ int cpu_zip_num_slots(void) { return g_slot_count; }
 int cpu_zip_queue_depth(void) { return 1; }
 int cpu_zip_src_cap(void) { return g_src_cap; }
 
+// Intel QPL only decodes a 4 KB history window, so shrink ours whenever an IAA worker may be the
+// one to decompress this chunk. kv_zip tags each block with the answer and routes accordingly.
+static int compress_window_bits(void) { return envs.IAXL_IAA_ZIP_ENABLE ? -12 : -MAX_WBITS; }
+
+int cpu_zip_iaa_decodable(void) { return compress_window_bits() >= -12; }
+
 int cpu_zip_compress(int slot, void *src, int len) {
     if (!g_slots || slot < 0 || slot >= g_slot_count || !src || len <= 0 || len > g_src_cap)
         return -1;
@@ -68,7 +74,7 @@ int cpu_zip_compress(int slot, void *src, int len) {
     CpuZipSlot *state = &g_slots[slot];
     z_stream stream = {0};
     state->ready = 0;
-    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -MAX_WBITS, 8,
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, compress_window_bits(), 8,
                      Z_DEFAULT_STRATEGY) != Z_OK)
         return -1;
     stream.next_in = src;

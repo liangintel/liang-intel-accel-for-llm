@@ -23,6 +23,13 @@ static const char *qat_devices_get(void) {
     return cached;
 }
 
+static const char *iaa_devices_get(void) {
+    static const char *cached = NULL;
+    if (!cached)
+        cached = env_str("IAXL_IAA_DEVICES", "auto");
+    return cached;
+}
+
 static const char *dsa_wqs_get(void) {
     static const char *cached = NULL;
     if (!cached)
@@ -32,6 +39,7 @@ static const char *dsa_wqs_get(void) {
 
 struct Envs envs = {
     .IAXL_QAT_DEVICES = qat_devices_get,
+    .IAXL_IAA_DEVICES = iaa_devices_get,
     .IAXL_DSA_WQS = dsa_wqs_get,
 };
 
@@ -50,18 +58,25 @@ __attribute__((constructor(101))) void envs_init(void) {
     envs.IAXL_ZIP_DST_CAP = env_int("IAXL_ZIP_DST_CAP", 256 * 1024);
 
     envs.IAXL_QAT_ZIP_ENABLE = env_bool("IAXL_QAT_ZIP_ENABLE", 1);
+    envs.IAXL_IAA_ZIP_ENABLE = env_bool("IAXL_IAA_ZIP_ENABLE", 0);
     envs.IAXL_CPU_ZIP_ENABLE = env_bool("IAXL_CPU_ZIP_ENABLE", 1);
     envs.IAXL_QAT_INSTANCE_NUM = env_nonnegative_int("IAXL_QAT_INSTANCE_NUM", 4);
+    envs.IAXL_IAA_INSTANCE_NUM = env_nonnegative_int("IAXL_IAA_INSTANCE_NUM", 4);
 
     envs.IAXL_QAT_ZIP_INSTANCES_PER_DEVICE = env_int("IAXL_QAT_ZIP_INSTANCES_PER_DEVICE", 4);
     envs.IAXL_QAT_ZIP_QUEUE_DEPTH = env_int("IAXL_QAT_ZIP_QUEUE_DEPTH", 4);
+    envs.IAXL_IAA_ZIP_INSTANCES_PER_DEVICE = env_int("IAXL_IAA_ZIP_INSTANCES_PER_DEVICE", 4);
+    envs.IAXL_IAA_ZIP_QUEUE_DEPTH = env_int("IAXL_IAA_ZIP_QUEUE_DEPTH", 4);
     envs.IAXL_CPU_ZIP_THREADS = env_nonnegative_int("IAXL_CPU_ZIP_THREADS", 4);
     if (!envs.IAXL_QAT_ZIP_ENABLE)
         envs.IAXL_QAT_INSTANCE_NUM = 0;
+    if (!envs.IAXL_IAA_ZIP_ENABLE)
+        envs.IAXL_IAA_INSTANCE_NUM = 0;
     if (!envs.IAXL_CPU_ZIP_ENABLE)
         envs.IAXL_CPU_ZIP_THREADS = 0;
     envs.IAXL_OMP_THREAD_NUM =
-        env_int("OMP_NUM_THREADS", envs.IAXL_QAT_INSTANCE_NUM + envs.IAXL_CPU_ZIP_THREADS);
+        env_int("OMP_NUM_THREADS", envs.IAXL_QAT_INSTANCE_NUM + envs.IAXL_IAA_INSTANCE_NUM +
+                                       envs.IAXL_CPU_ZIP_THREADS);
 
     envs.IAXL_KV_COMPRESSION = env_bool("IAXL_KV_COMPRESSION", 1);
     envs.IAXL_KV_LOSSY_TRUNC = env_int("IAXL_KV_LOSSY_TRUNC", 0);
@@ -93,13 +108,16 @@ __attribute__((constructor(101))) void envs_init(void) {
         }
 #endif
 
-         printf("[iaxl] config: qat_zip=%s cpu_zip=%s qat_instances=%d cpu_zip_threads=%d "
+         printf("[iaxl] config: qat_zip=%s iaa_zip=%s cpu_zip=%s qat_instances=%d "
+             "iaa_instances=%d cpu_zip_threads=%d "
              "omp_threads=%d cpus=%d "
                "compression=%s data_shuffle=%s lossy_trunc=%d dsa_gd=%s "
                "dsa_gd_reset=%s "
                "profile=%s\n",
                envs.IAXL_QAT_ZIP_ENABLE ? "ON" : "OFF",
+               envs.IAXL_IAA_ZIP_ENABLE ? "ON" : "OFF",
                envs.IAXL_CPU_ZIP_ENABLE ? "ON" : "OFF", envs.IAXL_QAT_INSTANCE_NUM,
+               envs.IAXL_IAA_INSTANCE_NUM,
                envs.IAXL_CPU_ZIP_THREADS,
                envs.IAXL_OMP_THREAD_NUM, cpus, envs.IAXL_KV_COMPRESSION ? "ON" : "OFF",
                envs.IAXL_KV_DATA_SHUFFLE ? "ON" : "OFF", envs.IAXL_KV_LOSSY_TRUNC,
