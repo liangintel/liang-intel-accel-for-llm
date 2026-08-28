@@ -17,6 +17,9 @@ int cpu_zip_queue_depth(void);
 
 int cpu_zip_src_cap(void);
 
+// Non-zero when this build's compressed output stays inside the 4 KB window IAA can decode.
+int cpu_zip_iaa_decodable(void);
+
 int cpu_zip_compress(int slot, void *src, int len);
 int cpu_zip_decompress(int slot, void *src, int len);
 
