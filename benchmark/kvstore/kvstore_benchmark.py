@@ -78,6 +78,16 @@ def parse_args() -> argparse.Namespace:
         help="Shape of one KV cache layer. KV_HEADS is 8 for TP=1, 1 for TP=8.",
     )
     parser.add_argument(
+        "--sync-dir",
+        default=None,
+        help="Rendezvous directory shared by concurrent benchmark processes, so "
+        "their timed PUT and GET phases overlap instead of drifting apart.",
+    )
+    parser.add_argument(
+        "--sync-count", type=int, default=1,
+        help="Number of processes meeting at --sync-dir.",
+    )
+    parser.add_argument(
         "--dtype",
         choices=tuple(DTYPE_MAP),
         default="bf16",
@@ -220,6 +230,19 @@ def cache_status_rest(metrics_url: str) -> dict:
     return _rest_get_json(status_url)
 
 
+def barrier(sync_dir: str, count: int, tag: str, timeout: float = 600.0) -> None:
+    if not sync_dir or count <= 1:
+        return
+    slot = os.path.join(sync_dir, tag)
+    os.makedirs(slot, exist_ok=True)
+    open(os.path.join(slot, str(os.getpid())), "w").close()
+    deadline = time.perf_counter() + timeout
+    while len(os.listdir(slot)) < count:
+        if time.perf_counter() > deadline:
+            raise RuntimeError(f"barrier '{tag}' timed out waiting for {count} processes")
+        time.sleep(0.002)
+
+
 def run_benchmark(args: argparse.Namespace) -> bool:
     if get_accelerator_device() != "cuda":
         print("No CUDA device available; KVStore benchmark cannot run.")
@@ -287,6 +310,7 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     cache_metrics_rest(args.metrics_url, "reset=1")
 
     torch.cuda.synchronize()
+    barrier(args.sync_dir, args.sync_count, "put")
     start = time.perf_counter()
     with torch.cuda.nvtx.range("benchmark PUT"):
         put_tasks = {}
@@ -306,6 +330,7 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     for tensor in kv_caches.values():
         tensor.zero_()
     torch.cuda.synchronize()
+    barrier(args.sync_dir, args.sync_count, "get")
 
     start = time.perf_counter()
     with torch.cuda.nvtx.range("benchmark GET"):

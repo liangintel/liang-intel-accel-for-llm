@@ -376,7 +376,10 @@ class KVShrinkConnector(KVConnectorBase_V1):
                 break
 
         first_kv_cache = next(iter(kv_caches.values()))
-        block_dim = 0 if self.use_mla or first_kv_cache.shape[1] == 2 else 1
+        # Only the legacy (2, num_blocks, ...) layout puts the KV pair ahead of the
+        # block index; every other layout, including the 4-D one vLLM >= 0.27 uses
+        # for packed K/V, is block-major.
+        block_dim = 1 if first_kv_cache.dim() == 5 and first_kv_cache.shape[0] == 2 else 0
         self._last_layer_name = next(reversed(kv_caches))
         self._layer_names = list(kv_caches.keys())
         self.kvstore = KVStore(

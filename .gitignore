@@ -18,6 +18,8 @@
 *.pdb
 
 # Compiled Dynamic libraries
+*.so
+*.so.*
 *.dylib
 *.dll
 
@@ -34,6 +36,7 @@
 *.exe
 *.out
 *.app
+iaxl/csrc/*_test
 
 # Debug information files
 *.dwo
@@ -53,3 +56,4 @@
 *.swp
 _build
 _lib
+_data

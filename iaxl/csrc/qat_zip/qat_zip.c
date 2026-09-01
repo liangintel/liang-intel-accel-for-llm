@@ -201,6 +201,10 @@ static void instance_init(Instance *d, const RawInst *r) {
     sd.sessDirection = CPA_DC_DIR_COMBINED;
     sd.sessState = CPA_DC_STATELESS;
     sd.checksum = CPA_DC_CRC32;
+    // gen4 always compresses with a 32 KB history window: cpaDcQueryCapabilities
+    // reports no smaller size and a CPA_DC_WINSIZE_4K session still emits 32 KB
+    // distances, which is why IAA cannot decompress QAT streams.
+    sd.windowSize = CPA_DC_WINSIZE_32K;
 
     d->inst = r->inst;
     d->node = r->node;

@@ -65,9 +65,10 @@ file(GLOB KV_POOL_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_pool/*.cpp")
 file(GLOB KV_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/kv_zip/*.cpp")
 file(GLOB QAT_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/qat_zip/*.c")
 file(GLOB CPU_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/cpu_zip/*.c")
+file(GLOB IAA_ZIP_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/iaa_zip/*.c")
 file(GLOB COMMON_SRCS CONFIGURE_DEPENDS "${IAXL_CSRC_DIR}/common/*.c")
 set(IAXL_SRCS ${TORCH_EXT_SRCS} ${KV_POOL_SRCS} ${KV_ZIP_SRCS} ${QAT_ZIP_SRCS} ${CPU_ZIP_SRCS}
-              ${COMMON_SRCS})
+              ${IAA_ZIP_SRCS} ${COMMON_SRCS})
 
 if(DEVICE STREQUAL "cuda")
     list(APPEND IAXL_SRCS "${IAXL_CSRC_DIR}/kv_xfer/cuda.cpp" "${IAXL_CSRC_DIR}/kv_xfer/dsa.cpp")
@@ -88,8 +89,18 @@ add_custom_command(
     VERBATIM)
 add_custom_target(qat_userspace_libs DEPENDS ${QAT_USERSPACE_LIBS})
 
+set(QPL_PREFIX "${CMAKE_SOURCE_DIR}/_build/qpl/install")
+set(QPL_USERSPACE_LIBS "${IAXL_LIB_DIR}/libqpl.so")
+add_custom_command(
+    OUTPUT ${QPL_USERSPACE_LIBS}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${IAXL_LIB_DIR}"
+    COMMAND make -C "${IAXL_CSRC_DIR}" DEVICE=${DEVICE} qpl-userspace
+    COMMENT "Building Intel QPL (IAA) user-space library"
+    VERBATIM)
+add_custom_target(qpl_userspace_libs DEPENDS ${QPL_USERSPACE_LIBS})
+
 pybind11_add_module(torch_ext ${IAXL_SRCS})
-add_dependencies(torch_ext qat_userspace_libs)
+add_dependencies(torch_ext qat_userspace_libs qpl_userspace_libs)
 
 target_compile_definitions(
     torch_ext
@@ -103,10 +114,13 @@ target_include_directories(
     torch_ext
     PRIVATE "${PYTORCH_PATH}/include" "${PYTORCH_PATH}/include/torch/csrc/api/include"
             "${IAXL_CSRC_DIR}/include" "${IAXL_CSRC_DIR}/torch_ext"
-            "${IAXL_CSRC_DIR}/qat_zip/include")
+            "${IAXL_CSRC_DIR}/qat_zip/include" "${QPL_PREFIX}/include" "$ENV{CONDA_PREFIX}/include")
 target_link_directories(torch_ext PRIVATE "${PYTORCH_PATH}/lib" "${IAXL_LIB_DIR}")
 find_package(ZLIB REQUIRED)
-target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s ZLIB::ZLIB)
+find_library(LZ4_LIBRARY NAMES lz4 HINTS "$ENV{CONDA_PREFIX}/lib" REQUIRED)
+find_library(ZSTD_LIBRARY NAMES zstd HINTS "$ENV{CONDA_PREFIX}/lib" REQUIRED)
+target_link_libraries(torch_ext PRIVATE torch torch_python qat_s usdm_drv_s qpl ZLIB::ZLIB
+                                        ${LZ4_LIBRARY} ${ZSTD_LIBRARY} dl)
 
 if(DEVICE STREQUAL "cuda")
     find_package(CUDAToolkit REQUIRED)
