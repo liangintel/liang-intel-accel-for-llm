@@ -9,10 +9,14 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "qpl/qpl.h"
 
@@ -25,10 +29,17 @@
 #define MAX_QUEUE_DEPTH 4
 #define BUSY_RETRY_LIMIT 1000000
 
+// From <linux/mempolicy.h>, redefined here to avoid a libnuma dependency.
+#define IAXL_MPOL_BIND 2
+#define IAXL_MPOL_MF_MOVE (1 << 1)
+#define IAXL_MPOL_MAX_NODES 256
+
 typedef struct {
     qpl_job *job;
     uint8_t *in;
     uint8_t *out;
+    size_t job_len;
+    size_t buf_len;
     int submitted;
 } IaaSlot;
 
@@ -135,32 +146,80 @@ static int select_iaa_nodes(const char *env, IaaNode *out, int max_nodes) {
     return n;
 }
 
-static void *alloc_aligned(size_t size) {
-    return aligned_alloc(64, (size + 63) & ~(size_t)63);
+static int g_pin_warned;
+
+static size_t page_round_up(size_t size) {
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    return (size + page - 1) & ~(page - 1);
+}
+
+// IAA reaches these buffers through the IOMMU, and the completion record inside qpl_job
+// is written back by the device, so any page that loses its PTE after the first touch
+// turns into an IO page fault: a stall when the WQ allows block-on-fault, a failed
+// descriptor when it does not. Touching once is not enough because numa_balancing keeps
+// re-protecting anonymous pages to sample them. An explicit mempolicy takes the mapping
+// out of AutoNUMA scanning and puts the pages on the node that will drive the jobs;
+// mlock then keeps them resident against reclaim.
+static void *alloc_dma_buffer(size_t len, int node) {
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+        return NULL;
+
+    if (node >= 0 && node < IAXL_MPOL_MAX_NODES) {
+        unsigned long nodemask[IAXL_MPOL_MAX_NODES / 64] = {0};
+        nodemask[node / 64] = 1UL << (node % 64);
+        if (syscall(SYS_mbind, p, len, IAXL_MPOL_BIND, nodemask, IAXL_MPOL_MAX_NODES,
+                    IAXL_MPOL_MF_MOVE) != 0 &&
+            !g_pin_warned) {
+            g_pin_warned = 1;
+            fprintf(stderr, "[iaa_zip] mbind to node %d failed (%s); buffers stay subject to "
+                            "numa_balancing\n",
+                    node, strerror(errno));
+        }
+    }
+
+    if (mlock(p, len) != 0) {
+        if (!g_pin_warned) {
+            g_pin_warned = 1;
+            fprintf(stderr, "[iaa_zip] mlock failed (%s); raise RLIMIT_MEMLOCK or IAA will "
+                            "take IO page faults\n",
+                    strerror(errno));
+        }
+        memset(p, 0, len);
+    }
+    return p;
+}
+
+static void free_dma_buffer(void *p, size_t len) {
+    if (!p || len == 0)
+        return;
+    munlock(p, len);
+    munmap(p, len);
 }
 
 static void slot_teardown(IaaSlot *sl) {
     if (sl->job) {
         qpl_fini_job(sl->job);
-        free(sl->job);
+        free_dma_buffer(sl->job, sl->job_len);
         sl->job = NULL;
     }
-    free(sl->in);
-    free(sl->out);
+    free_dma_buffer(sl->in, sl->buf_len);
+    free_dma_buffer(sl->out, sl->buf_len);
     sl->in = NULL;
     sl->out = NULL;
+    sl->job_len = 0;
+    sl->buf_len = 0;
     sl->submitted = 0;
 }
 
 static int slot_init(IaaSlot *sl, uint32_t job_size, int numa_id) {
-    sl->job = alloc_aligned(job_size);
-    sl->in = alloc_aligned(g_buf_cap);
-    sl->out = alloc_aligned(g_buf_cap);
+    sl->job_len = page_round_up(job_size);
+    sl->buf_len = page_round_up(g_buf_cap);
+    sl->job = alloc_dma_buffer(sl->job_len, numa_id);
+    sl->in = alloc_dma_buffer(sl->buf_len, numa_id);
+    sl->out = alloc_dma_buffer(sl->buf_len, numa_id);
     if (!sl->job || !sl->in || !sl->out)
         return -1;
-    // IAA cannot resolve page faults itself, so fault the DMA buffers in up front.
-    memset(sl->in, 0, g_buf_cap);
-    memset(sl->out, 0, g_buf_cap);
     if (qpl_init_job(qpl_path_hardware, sl->job) != QPL_STS_OK)
         return -1;
     sl->job->numa_id = numa_id;
