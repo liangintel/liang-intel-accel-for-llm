@@ -64,6 +64,35 @@ TTFT_PAT = {
     "successful": r"Successful requests:\s+(\d+)",
 }
 
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def pgid_cpu_seconds(pgids: set) -> dict:
+    """utime+stime of every task in each process group, in CPU-seconds."""
+    total = {g: 0.0 for g in pgids}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as fp:
+                # comm can contain spaces and parentheses, so split after the last ')'.
+                fields = fp.read().rpartition(")")[2].split()
+        except OSError:
+            continue
+        if len(fields) < 13:
+            continue
+        pgid = int(fields[2])
+        if pgid in total:
+            total[pgid] += (int(fields[11]) + int(fields[12])) / CLK_TCK
+    return total
+
+
+def host_cpu_seconds() -> float:
+    """Busy CPU-seconds host-wide, which also captures kernel-side accelerator work."""
+    with open("/proc/stat") as fp:
+        f = [int(x) for x in fp.readline().split()[1:9]]
+    return (sum(f) - f[3] - f[4]) / CLK_TCK
+
 
 def node_cpus(node: int) -> list:
     with open(f"/sys/devices/system/node/node{node}/cpulist") as fp:
@@ -223,10 +252,24 @@ def run_group(gpus: list, cfg: dict, args) -> list:
         if not wait_ready(ports, procs, args.startup_timeout):
             return [{"error": "server startup failed/timed out (see /tmp/ttft_server_gpu*.log)"}]
 
+        server_pgids = [os.getpgid(p.pid) for p in procs]
+        t0 = time.time()
+        cpu0, host0 = pgid_cpu_seconds(set(server_pgids)), host_cpu_seconds()
         with ThreadPoolExecutor(max_workers=len(ports)) as pool:
             futs = [pool.submit(run_bench, p, args.model, args,
                                 f"/tmp/ttft_bench_p{p}.log") for p in ports]
-            return [f.result() for f in futs]
+            rows = [f.result() for f in futs]
+        wall = max(time.time() - t0, 1e-9)
+        cpu1, host1 = pgid_cpu_seconds(set(server_pgids)), host_cpu_seconds()
+
+        for row, pgid in zip(rows, server_pgids):
+            cpu_s = cpu1[pgid] - cpu0[pgid]
+            row["cpu_core_s"] = cpu_s
+            row["cpu_cores"] = cpu_s / wall
+            row["cpu_s_per_req"] = cpu_s / row["successful"] if row.get("successful") else None
+            row["host_cpu_cores"] = (host1 - host0) / wall
+            row["bench_wall_s"] = wall
+        return rows
     finally:
         pgids = []
         for p in procs:
@@ -251,9 +294,9 @@ def run_group(gpus: list, cfg: dict, args) -> list:
         wait_gpu_idle()
 
 
-HDR = (f"{'config':>10} {'GPUs':>5} {'TTFT mean':>10} {'TTFT p50':>9} {'TTFT p90':>9} "
-       f"{'TTFT p95':>9} {'TTFT p99':>9} {'TTFT worst':>11} {'TPOT mean':>10} "
-       f"{'ITL p99':>8} {'E2EL p50':>9} {'E2EL p99':>9} {'req/s tot':>10} {'ok':>3}")
+HDR = (f"{'config':>10} {'GPUs':>5} {'TTFT mean':>10} {'TTFT p50':>9} {'TTFT p95':>9} "
+       f"{'TTFT p99':>9} {'TPOT mean':>10} {'E2EL p99':>9} {'CPU cores':>10} "
+       f"{'CPUs/req':>9} {'host cores':>11} {'req/s tot':>10} {'ok':>3}")
 
 
 def summarize(name: str, n: int, rows: list) -> str:
@@ -265,13 +308,14 @@ def summarize(name: str, n: int, rows: list) -> str:
         vals = [r[key] for r in rows if r.get(key) is not None]
         return sum(vals) / len(vals) if vals else float("nan")
 
-    worst = max(r["ttft_mean_ms"] for r in rows)
-    rps = sum(r["req_throughput"] for r in rows if r.get("req_throughput") is not None)
+    def total(key):
+        return sum(r[key] for r in rows if r.get(key) is not None)
+
     return (f"{name:>10} {n:>5} {mean('ttft_mean_ms'):>10.1f} {mean('ttft_p50_ms'):>9.1f} "
-            f"{mean('ttft_p90_ms'):>9.1f} {mean('ttft_p95_ms'):>9.1f} "
-            f"{mean('ttft_p99_ms'):>9.1f} {worst:>11.1f} {mean('tpot_mean_ms'):>10.2f} "
-            f"{mean('itl_p99_ms'):>8.2f} {mean('e2el_p50_ms'):>9.1f} "
-            f"{mean('e2el_p99_ms'):>9.1f} {rps:>10.2f} {'Y':>3}")
+            f"{mean('ttft_p95_ms'):>9.1f} {mean('ttft_p99_ms'):>9.1f} "
+            f"{mean('tpot_mean_ms'):>10.2f} {mean('e2el_p99_ms'):>9.1f} "
+            f"{total('cpu_cores'):>10.1f} {mean('cpu_s_per_req'):>9.2f} "
+            f"{mean('host_cpu_cores'):>11.1f} {total('req_throughput'):>10.2f} {'Y':>3}")
 
 
 def main() -> int:

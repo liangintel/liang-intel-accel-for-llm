@@ -6,9 +6,10 @@ import argparse
 import json
 import math
 import os
+import resource
 import time
 import urllib.request
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -109,6 +110,21 @@ def parse_args() -> argparse.Namespace:
         "to fit). If omitted, deterministic mock data is generated.",
     )
     parser.add_argument(
+        "--iters",
+        type=int,
+        default=1,
+        help="Timed PUT/GET repetitions. Each one uses its own set of block "
+        "hashes, so a PUT never overwrites a previous iteration and every GET "
+        "is a hit; percentiles are only meaningful once this is >= ~20. Host "
+        "memory grows with iters x payload.",
+    )
+    parser.add_argument(
+        "--json-out",
+        default=None,
+        help="Write per-iteration latencies and CPU accounting here as JSON. "
+        "The console output stays human-readable either way.",
+    )
+    parser.add_argument(
         "--metrics-url",
         default=DEFAULT_METRICS_URL,
         help="KVStore REST endpoint for compression throughput metrics.",
@@ -122,6 +138,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("all --kv-cache-shape dimensions must be greater than 0")
     if args.num_layers <= 0:
         parser.error("--num-layers must be greater than 0")
+    if args.iters <= 0:
+        parser.error("--iters must be greater than 0")
     args.kv_cache_shape = shape
     return args
 
@@ -135,8 +153,8 @@ def format_bytes(num_bytes: int) -> str:
     raise AssertionError("unreachable")
 
 
-def make_block_hashes(num_blocks: int) -> List[str]:
-    return [str(i) for i in range(num_blocks)]
+def make_block_hashes(num_blocks: int, prefix: str = "") -> List[str]:
+    return [f"{prefix}{i}" for i in range(num_blocks)]
 
 
 def generate_mock_kv_cache(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -214,6 +232,52 @@ def print_result(name: str, elapsed: float, num_blocks: int, num_bytes: int) -> 
     )
 
 
+def pctl(samples: List[float], q: float) -> float:
+    """Linear-interpolated percentile, same convention as numpy's default."""
+    if not samples:
+        return float("nan")
+    ordered = sorted(samples)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q / 100.0
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
+
+
+def self_cpu_seconds() -> float:
+    """utime+stime of this process, summed over all its threads."""
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return usage.ru_utime + usage.ru_stime
+
+
+def host_cpu_seconds() -> float:
+    """Busy CPU-seconds host-wide, which also captures kernel-side accelerator work."""
+    with open("/proc/stat") as fp:
+        fields = [int(x) for x in fp.readline().split()[1:9]]
+    return (sum(fields) - fields[3] - fields[4]) / os.sysconf("SC_CLK_TCK")
+
+
+def print_phase(name: str, stats: Dict, bytes_per_iter: int) -> None:
+    times = stats["times_s"]
+    mean = sum(times) / len(times)
+    print(
+        f"{name} latency (n={len(times)}): "
+        f"mean {mean * 1e3:.2f} ms, p50 {pctl(times, 50) * 1e3:.2f}, "
+        f"p95 {pctl(times, 95) * 1e3:.2f}, p99 {pctl(times, 99) * 1e3:.2f}, "
+        f"min {min(times) * 1e3:.2f}, max {max(times) * 1e3:.2f}"
+    )
+    print(
+        f"{name} bandwidth: mean {bytes_per_iter / mean / 1024**3:.3f} GiB/s, "
+        f"p50 {bytes_per_iter / pctl(times, 50) / 1024**3:.3f} GiB/s"
+    )
+    print(
+        f"{name} CPU: {stats['cpu_cores']:.2f} cores process, "
+        f"{stats['host_cpu_cores']:.2f} cores host, "
+        f"{stats['cpu_core_s'] / len(times) * 1e3:.1f} CPU-ms per op"
+    )
+
+
 def _rest_get_json(url: str, query: str = "") -> dict:
     if query:
         url = f"{url}?{query}"
@@ -288,6 +352,9 @@ def run_benchmark(args: argparse.Namespace) -> bool:
     expected = kv_caches[layer_names[0]].index_select(BLOCK_DIM, index).clone()
 
     block_hashes = make_block_hashes(num_blocks)
+    # One hash set per iteration: a PUT never overwrites an earlier iteration and
+    # every GET is a hit, so both phases measure the same amount of real work.
+    hash_sets = [make_block_hashes(num_blocks, f"i{i}_") for i in range(args.iters)]
 
     kvstore = KVStore(
         model_name="kvstore_benchmark",
@@ -309,48 +376,81 @@ def run_benchmark(args: argparse.Namespace) -> bool:
 
     cache_metrics_rest(args.metrics_url, "reset=1")
 
-    torch.cuda.synchronize()
-    barrier(args.sync_dir, args.sync_count, "put")
-    start = time.perf_counter()
-    with torch.cuda.nvtx.range("benchmark PUT"):
-        put_tasks = {}
-        for name in layer_names:
-            put_tasks.update(
-                kvstore.put(
-                    block_indices,
-                    block_hashes,
-                    layer_names=[name],
-                    description="benchmark PUT",
+    def timed_put(i: int) -> float:
+        # Rendezvous outside the timer, so the barrier wait is not charged to the
+        # operation but every process still starts this iteration together.
+        barrier(args.sync_dir, args.sync_count, f"put{i}")
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        with torch.cuda.nvtx.range("benchmark PUT"):
+            put_tasks = {}
+            for name in layer_names:
+                put_tasks.update(
+                    kvstore.put(
+                        block_indices,
+                        hash_sets[i],
+                        layer_names=[name],
+                        description="benchmark PUT",
+                    )
                 )
+            if not kvstore.put_wait(put_tasks):
+                raise RuntimeError("PUT did not complete")
+        return time.perf_counter() - start
+
+    def timed_get(i: int) -> float:
+        barrier(args.sync_dir, args.sync_count, f"get{i}")
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        with torch.cuda.nvtx.range("benchmark GET"):
+            get_tasks = kvstore.get(
+                block_indices, hash_sets[i], layer_names=None,
+                description="benchmark GET",
             )
-        if not kvstore.put_wait(put_tasks):
-            raise RuntimeError("PUT did not complete")
-    put_time = time.perf_counter() - start
+            for name in layer_names:
+                if not kvstore.get_wait(get_tasks, layer_names=[name]):
+                    raise RuntimeError("GET did not complete")
+        return time.perf_counter() - start
+
+    def run_phase(fn) -> Dict:
+        cpu0, host0 = self_cpu_seconds(), host_cpu_seconds()
+        t0 = time.perf_counter()
+        times = [fn(i) for i in range(args.iters)]
+        wall = max(time.perf_counter() - t0, 1e-9)
+        cpu = self_cpu_seconds() - cpu0
+        return {
+            "times_s": times,
+            "wall_s": wall,
+            "cpu_core_s": cpu,
+            "cpu_cores": cpu / wall,
+            "host_cpu_cores": (host_cpu_seconds() - host0) / wall,
+        }
+
+    torch.cuda.synchronize()
+    put_stats = run_phase(timed_put)
 
     for tensor in kv_caches.values():
         tensor.zero_()
     torch.cuda.synchronize()
-    barrier(args.sync_dir, args.sync_count, "get")
+    get_stats = run_phase(timed_get)
 
-    start = time.perf_counter()
-    with torch.cuda.nvtx.range("benchmark GET"):
-        get_tasks = kvstore.get(
-            block_indices, block_hashes, layer_names=None, description="benchmark GET"
-        )
-        for name in layer_names:
-            if not kvstore.get_wait(get_tasks, layer_names=[name]):
-                raise RuntimeError("GET did not complete")
-    get_time = time.perf_counter() - start
-
+    # Every iteration stored identical payload, so the last GET must have restored
+    # the tensors that were zeroed above.
     verified = all(
         torch.equal(kv_caches[name].index_select(BLOCK_DIM, index), expected)
         for name in layer_names
     )
 
+    put_time = sum(put_stats["times_s"])
+    get_time = sum(get_stats["times_s"])
+
     print("\nResults")
     print("-" * 80)
-    print_result("PUT", put_time, total_blocks, total_bytes)
-    print_result("GET", get_time, total_blocks, total_bytes)
+    # Aggregate lines first: multigpu_scale.py scrapes exactly this format.
+    print_result("PUT", put_time, total_blocks * args.iters, total_bytes * args.iters)
+    print_result("GET", get_time, total_blocks * args.iters, total_bytes * args.iters)
+    print()
+    print_phase("PUT", put_stats, total_bytes)
+    print_phase("GET", get_stats, total_bytes)
     print(f"Verification: {'passed' if verified else 'FAILED'}")
 
     status = cache_status_rest(args.metrics_url)
@@ -378,6 +478,30 @@ def run_benchmark(args: argparse.Namespace) -> bool:
         f"Decompress throughput: {metrics['decompress_gbps']:.3f} GB/s "
         f"({format_bytes(metrics['decompress_bytes'])} in {metrics['decompress_ns'] / 1e6:.1f} ms)"
     )
+
+    if args.json_out:
+        # Raw per-iteration latencies are kept so any percentile can be recomputed
+        # later without re-running the sweep.
+        with open(args.json_out, "w") as fp:
+            json.dump({
+                "kv_cache_shape": list(shape),
+                "num_layers": num_layers,
+                "dtype": args.dtype,
+                "iters": args.iters,
+                "blocks_per_iter": total_blocks,
+                "bytes_per_iter": total_bytes,
+                "verified": verified,
+                "put": put_stats,
+                "get": get_stats,
+                "compression_ratio":
+                    status["compression_ratio (unzip/zip, higher=better)"],
+                "hits": status["hits"],
+                "misses": status["misses"],
+                "puts": status["puts"],
+                "compress_gbps": metrics["compress_gbps"],
+                "decompress_gbps": metrics["decompress_gbps"],
+            }, fp)
+
     return verified
 
 

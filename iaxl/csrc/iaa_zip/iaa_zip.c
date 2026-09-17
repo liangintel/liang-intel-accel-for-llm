@@ -7,6 +7,11 @@
 // The produced streams are raw DEFLATE, so they stay interchangeable with the
 // QAT and zlib backends.
 
+// MAP_ANONYMOUS: the CMake build compiles this with a strict -std, unlike the Makefile.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
