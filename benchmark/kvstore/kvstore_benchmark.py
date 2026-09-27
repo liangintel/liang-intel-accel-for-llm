@@ -144,6 +144,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "<model>_<dtype>.pt and reused whenever they match the requested shape.",
     )
     parser.add_argument(
+        "--kv-cache-file",
+        default=None,
+        help="Explicit .pt file holding the KV layers, replacing the "
+        "<model>_<dtype>.pt name under --kv-data-dir. It must exist and match "
+        "the requested shape; it is never regenerated nor overwritten.",
+    )
+    parser.add_argument(
         "--metrics-url",
         default=DEFAULT_METRICS_URL,
         help="KVStore REST endpoint for compression throughput metrics.",
@@ -165,8 +172,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.data_source == "file" and not args.data_file:
         parser.error("--data-source file requires --data-file")
     if args.data_source == "model":
-        if not args.model:
-            parser.error("--data-source model requires --model or the MODEL env var")
+        if not args.model and not args.kv_cache_file:
+            parser.error(
+                "--data-source model requires --model, the MODEL env var, "
+                "or --kv-cache-file"
+            )
         if args.model_seq_len <= 0 or args.model_seq_len % shape[2]:
             parser.error("--model-seq-len must be a positive multiple of TOKENS")
     args.kv_cache_shape = shape
@@ -366,6 +376,8 @@ def generate_model_kv_cache(
 
 
 def model_cache_path(args: argparse.Namespace, dtype_name: str) -> str:
+    if args.kv_cache_file:
+        return args.kv_cache_file
     model_tag = os.path.basename(args.model.rstrip("/"))
     return os.path.join(args.kv_data_dir, f"{model_tag}_{dtype_name}.pt")
 
@@ -380,11 +392,18 @@ def load_or_generate_model_kv_cache(
         if tuple(layers[0].shape) == expected:
             print(f"[model] reusing {len(layers)} cached KV layers from {path}")
             return layers
+        if args.kv_cache_file:
+            raise ValueError(
+                f"--kv-cache-file {path} holds shape {tuple(layers[0].shape)}, "
+                f"but the benchmark expects {expected}"
+            )
         print(
             f"[model] {path} holds shape {tuple(layers[0].shape)}, "
             f"regenerating for {expected}"
         )
         del layers
+    elif args.kv_cache_file:
+        raise FileNotFoundError(f"--kv-cache-file {path} does not exist")
 
     layers = generate_model_kv_cache(shape, dtype_name, args)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -440,7 +459,7 @@ def build_kv_caches(
 ) -> Dict[str, torch.Tensor]:
     shape = args.kv_cache_shape
     if args.data_source == "model":
-        print(f"\nBuilding KV cache from {args.model}...")
+        print(f"\nBuilding KV cache from {args.kv_cache_file or args.model}...")
         layers = load_or_generate_model_kv_cache(args, shape, args.dtype)
         return {
             name: layers[i % len(layers)].to("cuda")
